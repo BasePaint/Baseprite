@@ -10,7 +10,7 @@
 --    \::/__/      /:/  /      \::/  /      \:\__\                    |:|  |     \/__/               \:\__\    
 --     ~~          \/__/        \/__/        \/__/                     \|__|                          \/__/    
 
--- Baseprite by Creamy! 🐸💙🖌️ v2.3
+-- Baseprite by Creamy! 🐸💙🖌️ v2.4
 
 -- fetch palette from "basepaint.xyz/api/theme/day#"
 local function fetchBasepaintPalette(day)
@@ -58,6 +58,89 @@ local function getCurrentBasepaintDay()
   local diff = nowUTC - baseStart
   return math.floor(diff / secondsPerDay)
 end
+
+local function getScriptFolder()
+  local src = debug.getinfo(1, "S").source
+  return src:match("@(.*[\\/])") or "./"
+end
+
+local function shell_quote(s)
+  s = tostring(s or "")
+  s = s:gsub('"', '\\\"')
+  return '"' .. s .. '"'
+end
+
+local function file_nonempty(path)
+  local f = io.open(path, "rb")
+  if not f then return false end
+  local bytes = f:read("*a")
+  f:close()
+  return bytes ~= nil and #bytes > 64
+end
+
+local function loadImage(path)
+  local ok, img = pcall(function()
+    return Image{ fromFile = path }
+  end)
+  if not ok or not img then
+    return nil, "Failed to load PNG into Aseprite Image:\n" .. tostring(path)
+  end
+  return img, nil
+end
+
+local function ensureSprite(img)
+  local spr = app.activeSprite
+  if spr then return spr end
+  spr = Sprite(img.width, img.height, ColorMode.RGB)
+  app.activeSprite = spr
+  return spr
+end
+
+local function insertAsNewLayer(day, img)
+  local spr = ensureSprite(img)
+  local frame = spr.frames[1]
+  local layer = spr:newLayer()
+  layer.name = "Day " .. tostring(day)
+  local cel = spr:newCel(layer, frame)
+  cel.image = img
+  app.activeSprite = spr
+  app.activeLayer = layer
+  app.activeCel = cel
+  pcall(function() app.command.SelectAll() end)
+end
+
+local function exec_ok(a, b, c)
+  if type(a) == "boolean" then return a end
+  if type(c) == "number" then return c == 0 end
+  if type(a) == "number" then return a == 0 end
+  return false
+end
+
+local function downloadCanvasPNG(day, outPath)
+  local url = "https://basepaint.xyz/api/art/image?day=" .. day .. "&scale=1"
+  local cmd = 'curl -L -s ' .. shell_quote(url) .. ' -o ' .. shell_quote(outPath)
+  local r1, r2, r3 = os.execute(cmd)
+  if file_nonempty(outPath) then
+    return true, nil
+  end
+  if not exec_ok(r1, r2, r3) then
+    return false, "curl command failed AND output file wasn't created."
+  end
+  return false, "Download produced an invalid/empty file."
+end
+
+local function parseDayInput(raw)
+  if not raw then return nil end
+  local s = tostring(raw)
+  s = s:lower()
+  s = s:gsub("%s+", "")
+  s = s:gsub("day", "")
+  s = s:gsub("#", "")
+  local digits = s:match("(%d+)")
+  if not digits then return nil end
+  return tonumber(digits)
+end
+
 
 -- parse Frame # Input Field
 local function parseFrameInput(input, sprite)
@@ -420,6 +503,36 @@ local function createColorIndices(sprite, cel, palette)
       end
     }
   end
+
+-- Help Text
+  local BASEPRITE_HELP_LINES = {
+    "Day # - Enter a Basepaint day number here! (can be: 100, Day #100, or even try random!)",
+    "Load Palette - Loads the Basepaint palette from the input Day #.",
+    "Enter Hex - Manually set the palette using space-separated hex codes.",
+    "Grab Canvas - Downloads the canvas for the input Day # as a new layer.",
+    "Palette - View the active color palette! Click on a swatch to select the color.",
+    "Layer Menu - The layers dropdown menu, select which layer will be saved/copied.",
+    "Frame Input - Enter the Frame # you're targeting for export.",
+    "Refresh Layers List - Click this whenever you add new layers, to refresh the layer menu.",
+    "Count Pixels - Counts the amount of pixels for the selected layer & frame!",
+    "(You can enter 'all' in the frames input, then click Count Pixels to count for all frames!)",
+    "Import Pixels - Import pixel code from plain text (.txt) or .rtf (.doc not supported).",
+    "Save to File - Save a .txt file containing the pixel data. Be sure to set a filename & location.",
+    "(Once saved, the plugin will attempt to automatically open the file in a plain text editor)",
+    "Copy to Clipboard - Copies the pixel data to your clipboard, ready to paste into Basepaint!",
+  }
+
+  local function showBasepriteHelp()
+    local helpDlg = Dialog{ title="Baseprite Help", resizeable=true }
+
+    helpDlg:newrow{ always=true }
+
+    for _, line in ipairs(BASEPRITE_HELP_LINES) do
+      helpDlg:label{ text=line }
+    end
+
+    helpDlg:show{ wait=false, autoscrollbars=true }
+  end
   
 -- plugin window
   local function createDialog()
@@ -519,6 +632,47 @@ local function createColorIndices(sprite, cel, palette)
           }
           :button{ text="Cancel", onclick=function() hexDlg:close() end }
           :show()
+      end
+    }
+
+
+    dlg:newrow()
+    dlg:button{
+      text = "Grab Canvas",
+      onclick = function()
+        local rawDay = dlg.data and dlg.data.dayInput or ""
+        local day = parseDayInput(rawDay)
+        local maxDay = getCurrentBasepaintDay() + 1
+
+        if not day then
+          app.alert("Please enter a Day #.")
+          return
+        end
+
+        if day < 1 or day > maxDay then
+          app.alert("Day must be between 1 and " .. maxDay)
+          return
+        end
+
+        currentDayInput = tostring(day)
+
+        local scriptFolder = getScriptFolder()
+        local outPath = scriptFolder .. "basepaint_canvas.png"
+
+        local ok, err = downloadCanvasPNG(day, outPath)
+        if not ok then
+          app.alert("Grab Canvas failed.\n" .. tostring(err))
+          return
+        end
+
+        local img, imgErr = loadImage(outPath)
+        if not img then
+          app.alert(imgErr or "Failed to load image.")
+          return
+        end
+
+        insertAsNewLayer(day, img)
+        app.refresh()
       end
     }
 
@@ -761,14 +915,16 @@ local function createColorIndices(sprite, cel, palette)
         end
       end
     }
+
+    dlg:newrow()
+    dlg:separator()
       
-    dlg:label{
-        text = "Tip: Press Enter to approve popups!"
-      }
-      dlg:newrow()
-      dlg:label{
-          text = "(Sometimes the OK button is hidden)"
-        }
+    dlg:button{
+      text="Help?",
+      onclick=function()
+        showBasepriteHelp()
+      end
+    }
   
     dlg:show{ wait = false }
   end
