@@ -491,7 +491,138 @@ local function createColorIndices(sprite, cel, palette)
   local selectedLayerIndex = 2 -- default to Layer 2
   local currentDayInput = "Day #" -- set default day input text here
   local selectedSwatch = 1
-  
+  local CURSOR_STREAM_URL = "ws://aseprite.basepaint.xyz/baseprite"
+  local CURSOR_MOVE = 1
+  local CURSOR_LEAVE = 2
+  -- The script is re-run when its dialog is reopened; keep one shared stream.
+  local cursorStream = rawget(_G, "__basepriteCursorStream")
+  if type(cursorStream) ~= "table" then
+    cursorStream = { status = "Cursor stream stopped" }
+    rawset(_G, "__basepriteCursorStream", cursorStream)
+  end
+
+  local function setCursorStreamStatus(status)
+    cursorStream.status = status
+    local dialog = cursorStream.dialog
+    if not dialog then return end
+    pcall(function()
+      dialog:modify{
+        id = "cursorStreamToggle",
+        text = cursorStream.socket and "Stop Cursor Stream" or "Start Cursor Stream"
+      }
+      dialog:modify{ id = "cursorStreamStatus", text = status }
+    end)
+  end
+
+  local function stopCursorStreamTimer()
+    if cursorStream.timer then
+      cursorStream.timer:stop()
+      cursorStream.timer = nil
+    end
+  end
+
+  local function sendCursorStreamFrame(frame)
+    if not cursorStream.socket then return false end
+    local ok = pcall(function()
+      cursorStream.socket:sendBinary(frame)
+    end)
+    return ok
+  end
+
+  local function currentCursorFrame()
+    local editor = app.editor
+    local sprite = editor and editor.sprite
+    local point = editor and editor.spritePos
+    if not sprite or not point or sprite.width <= 0 or sprite.height <= 0 or
+       point.x < 0 or point.y < 0 or
+       point.x >= sprite.width or point.y >= sprite.height then
+      return string.char(CURSOR_LEAVE)
+    end
+
+    local x = math.floor((1000 * point.x) / sprite.width)
+    local y = math.floor((1000 * point.y) / sprite.height)
+    return string.char(
+      CURSOR_MOVE,
+      math.floor(x / 256), x % 256,
+      math.floor(y / 256), y % 256
+    )
+  end
+
+  local function sampleCursorStream()
+    local frame = currentCursorFrame()
+    if frame ~= cursorStream.lastFrame and sendCursorStreamFrame(frame) then
+      cursorStream.lastFrame = frame
+    end
+  end
+
+  local function stopCursorStream()
+    stopCursorStreamTimer()
+    sendCursorStreamFrame(string.char(CURSOR_LEAVE))
+
+    local socket = cursorStream.socket
+    cursorStream.socket = nil
+    cursorStream.lastFrame = nil
+    if socket then
+      pcall(function() socket:close() end)
+    end
+    setCursorStreamStatus("Cursor stream stopped")
+  end
+
+  local function handleCursorStreamMessage(socket, messageType, _, err)
+    if cursorStream.socket ~= socket then return end
+
+    if messageType == WebSocketMessageType.OPEN then
+      cursorStream.lastFrame = nil
+      setCursorStreamStatus("Streaming to BasePaint")
+      sampleCursorStream()
+      stopCursorStreamTimer()
+      cursorStream.timer = Timer{ interval = 1.0 / 20.0, ontick = sampleCursorStream }
+      cursorStream.timer:start()
+    elseif messageType == WebSocketMessageType.CLOSE then
+      cursorStream.lastFrame = nil
+      stopCursorStreamTimer()
+      setCursorStreamStatus("Cursor stream reconnecting...")
+    elseif err then
+      setCursorStreamStatus("Cursor stream error: " .. tostring(err))
+    end
+  end
+
+  local function startCursorStream()
+    if cursorStream.socket then return end
+    if not WebSocket or not WebSocketMessageType then
+      app.alert("This Aseprite version does not support WebSockets.")
+      return
+    end
+
+    local socket
+    local ok, createError = pcall(function()
+      socket = WebSocket{
+        url = CURSOR_STREAM_URL,
+        deflate = false,
+        minreconnectwait = 1,
+        maxreconnectwait = 5,
+        onreceive = function(...)
+          handleCursorStreamMessage(socket, ...)
+        end,
+      }
+    end)
+
+    if not ok or not socket then
+      setCursorStreamStatus("Could not create cursor WebSocket")
+      app.alert("Could not create cursor WebSocket:\n" .. tostring(createError))
+      return
+    end
+
+    cursorStream.socket = socket
+    cursorStream.lastFrame = nil
+    setCursorStreamStatus("Connecting to BasePaint...")
+    local connected, connectError = pcall(function() socket:connect() end)
+    if not connected then
+      stopCursorStream()
+      app.alert("Could not connect cursor WebSocket:\n" .. tostring(connectError))
+    end
+  end
+
   local function pickColor(index)
     app.useTool{
       tool = "eyedropper",
@@ -537,8 +668,17 @@ local function createColorIndices(sprite, cel, palette)
 -- plugin window
   local function createDialog()
     if dlg then dlg:close() end
-  
-    dlg = Dialog{ title = "Baseprite by Creamy" }
+
+    local dialog
+    dialog = Dialog{
+      title = "Baseprite by Creamy",
+      onclose = function()
+        if dlg == dialog then dlg = nil end
+        if cursorStream.dialog == dialog then cursorStream.dialog = nil end
+      end,
+    }
+    dlg = dialog
+    cursorStream.dialog = dialog
   
     -- day input
     dlg:entry{
@@ -674,6 +814,21 @@ local function createColorIndices(sprite, cel, palette)
         insertAsNewLayer(day, img)
         app.refresh()
       end
+    }
+
+    dlg:newrow()
+    dlg:separator()
+    dlg:button{
+      id = "cursorStreamToggle",
+      text = cursorStream.socket and "Stop Cursor Stream" or "Start Cursor Stream",
+      onclick = function()
+        if cursorStream.socket then stopCursorStream() else startCursorStream() end
+      end,
+    }
+    dlg:newrow()
+    dlg:label{
+      id = "cursorStreamStatus",
+      text = cursorStream.status,
     }
 
     dlg:newrow()
