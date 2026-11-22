@@ -493,7 +493,7 @@ local function createColorIndices(sprite, cel, palette)
   local selectedLayerIndex = 2 -- default to Layer 2
   local currentDayInput = "Day #" -- set default day input text here
   local selectedSwatch = 1
-  -- Live streaming to BasePaint: your cursor, and with your key from basepaint.xyz/aseprite, your unsaved pixels (the
+  -- Live streaming to BasePaint: your cursor, and with your code from basepaint.xyz/aseprite, your unsaved pixels (the
   -- layer and frame picked below, in today's palette) as a draft other painters can watch. It starts by itself whenever
   -- Baseprite opens, unless you stopped it; that choice and the key are saved in baseprite_settings.txt next to this
   -- script.
@@ -839,14 +839,14 @@ local function createColorIndices(sprite, cel, palette)
       stream.badKey = false
       stream.isOpen = true
       setStreamStatus(stream.settings.key and "Streaming your cursor and drafts" or
-        "Streaming your cursor. Set Key to share drafts.")
+        "Streaming your cursor. Paste Code to share drafts.")
       onTick()
       stream.timer = Timer{ interval = 1.0 / 20.0, ontick = onTick }
       stream.timer:start()
     elseif messageType == WebSocketMessageType.TEXT and tostring(data):find("bad_key", 1, true) then
       -- The server didn't accept the key (expired or mistyped): the cursor still shows, drafts don't.
       stream.badKey = true
-      setStreamStatus("Key not accepted. Copy a new one from " .. siteUrl() .. "/aseprite and Set Key.")
+      setStreamStatus("Code not accepted. Copy a new one from " .. siteUrl() .. "/aseprite and Paste Code.")
     elseif messageType == WebSocketMessageType.CLOSE then
       resetConnection()
       if stream.socket then setStreamStatus("Reconnecting...") end
@@ -907,11 +907,11 @@ local function createColorIndices(sprite, cel, palette)
     if on then startStream() else stopStream() end
   end
 
-  -- The key from basepaint.xyz/aseprite; streaming reconnects with it.
+  -- The code from basepaint.xyz/aseprite (a "key" in settings and the URL, kept for compatibility); streaming reconnects with it.
   local function askForKey()
-    local keyDlg = Dialog("Baseprite Key")
+    local keyDlg = Dialog("Baseprite Code")
     keyDlg
-      :label{ text = "Copy your key from " .. siteUrl() .. "/aseprite and paste it here." }
+      :label{ text = "Copy your code from " .. siteUrl() .. "/aseprite and paste it here. It isn't your wallet key." }
       :newrow()
       :entry{ id = "key", text = "", focus = true }
       :button{
@@ -920,7 +920,7 @@ local function createColorIndices(sprite, cel, palette)
           local key = (keyDlg.data.key or ""):match("^%s*([%w%-_%.]+)%s*$")
           keyDlg:close()
           if not key then
-            setStreamStatus("That doesn't look like a key. Copy it again from " .. siteUrl() .. "/aseprite.")
+            setStreamStatus("That doesn't look like a Baseprite code. Copy it again from " .. siteUrl() .. "/aseprite.")
             return
           end
           stream.settings.key = key
@@ -961,8 +961,8 @@ local function createColorIndices(sprite, cel, palette)
     "(Once saved, the plugin will attempt to automatically open the file in a plain text editor)",
     "Copy to Clipboard - Copies the pixel data to your clipboard, ready to paste into Basepaint!",
     "Start/Stop Streaming - Shows your cursor live on Basepaint. Baseprite remembers your choice next time it opens.",
-    "Set Key - Paste your key from basepaint.xyz/aseprite, once. Then others see your drafts live:",
-    "(your visible, unlocked layers on a 256x256 sprite, in today's palette. A layer that fills the whole canvas counts as background and stays out. Stopping takes your draft down.)",
+    "Paste Code - Paste your code from basepaint.xyz/aseprite, once (it isn't your wallet key). Then others see your drafts live:",
+    "(your visible, unlocked layers on a 256x256 sprite, in today's palette. A layer that fills the whole canvas with only today's colors counts as a canvas copy and stays out. Stopping takes your draft down.)",
   }
 
   local function showBasepriteHelp()
@@ -1136,7 +1136,7 @@ local function createColorIndices(sprite, cel, palette)
       onclick = function() setStreaming(not stream.socket) end,
     }
     dlg:button{
-      text = "Set Key",
+      text = "Paste Code",
       onclick = askForKey,
     }
     dlg:newrow()
