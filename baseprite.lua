@@ -718,10 +718,31 @@ local function createColorIndices(sprite, cel, palette)
   end
 
   -- Sends what changed since the last call: changed pixels, or the whole draft.
+  -- Reading the draft only happens after the sprite changes (or a different sprite or frame shows), so an idle
+  -- Aseprite costs nothing and painting costs at most four reads a second.
+  local function onSpriteChange() stream.dirty = true end
+  local function watchSprite(sprite)
+    if stream.watchedSprite == sprite then return end
+    local old = stream.watchedSprite
+    if old then pcall(function() old.events:off(onSpriteChange) end) end
+    stream.watchedSprite = sprite
+    if sprite then pcall(function() sprite.events:on("change", onSpriteChange) end) end
+    stream.dirty = true
+  end
+
   local function streamDraft()
     local day = currentBasepaintDay()
+    watchSprite(app.activeSprite)
+    local frameNumber = app.activeFrame and app.activeFrame.frameNumber
+    if not stream.dirty and stream.readDay == day and stream.readFrame == frameNumber then return end
+    stream.dirty = false
+    stream.readDay = day
+    stream.readFrame = frameNumber
     local draft = readDraft(day)
-    if not draft then return end
+    if not draft then
+      stream.dirty = true
+      return
+    end
     local sent = stream.sentDay == day and stream.sent or nil
 
     local changes = nil
@@ -743,6 +764,8 @@ local function createColorIndices(sprite, cel, palette)
         stream.hasSentLayer = false
         -- The first pixels after this go whole, replacing anything the server still holds for this painter.
         stream.sent = nil
+      else
+        stream.dirty = true
       end
       return
     elseif changes and #changes <= MAX_CHANGED_PIXELS * 2 then
@@ -760,6 +783,8 @@ local function createColorIndices(sprite, cel, palette)
     if ok then
       stream.sent = draft
       stream.sentDay = day
+    else
+      stream.dirty = true
     end
   end
 
@@ -786,6 +811,7 @@ local function createColorIndices(sprite, cel, palette)
     stream.lastFrame = nil
     -- The server may have missed what we sent; the next draft goes whole.
     stream.sent = nil
+    stream.dirty = true
     stopTimer()
   end
 
