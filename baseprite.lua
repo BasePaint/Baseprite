@@ -640,7 +640,7 @@ local function createColorIndices(sprite, cel, palette)
         local x, y = px.x + b.x, px.y + b.y
         if x >= 0 and x < CANVAS_SIZE and y >= 0 and y < CANVAS_SIZE then
           local value = px()
-          if (clear and value == clear) or (not clear and app.pixelColor.rgbaA(value) == 0) then return false end
+          if (clear and value == clear) or (not clear and value >> 24 == 0) then return false end
         end
       end
       return true
@@ -658,27 +658,24 @@ local function createColorIndices(sprite, cel, palette)
       end
     end
     drawLayers(sprite.layers)
-    local pos = { x = 0, y = 0 }
-    local isIndexed = img.colorMode == ColorMode.INDEXED
-    local spritePalette = isIndexed and sprite.palettes[1]
-    for px in img:pixels() do
-      local x = px.x + pos.x
-      local y = px.y + pos.y
-      if x >= 0 and x < CANVAS_SIZE and y >= 0 and y < CANVAS_SIZE then
-        local value = px()
-        local r, g, b, a
-        if isIndexed then
-          if value ~= sprite.transparentColor and value < #spritePalette then
-            local c = spritePalette:getColor(value)
-            r, g, b, a = c.red, c.green, c.blue, c.alpha
-          end
-        else
-          r, g, b, a = app.pixelColor.rgbaR(value), app.pixelColor.rgbaG(value),
-            app.pixelColor.rgbaB(value), app.pixelColor.rgbaA(value)
+    -- Today's palette index for each raw pixel value: an opaque RGBA value, or a sprite palette entry when indexed.
+    local lookup = {}
+    if img.colorMode == ColorMode.INDEXED then
+      local spritePalette = sprite.palettes[1]
+      for i = 0, #spritePalette - 1 do
+        local c = spritePalette:getColor(i)
+        if i ~= sprite.transparentColor and c.alpha == 255 then
+          lookup[i] = colors[c.red * 65536 + c.green * 256 + c.blue]
         end
-        local index = a == 255 and colors[r * 65536 + g * 256 + b]
-        if index then draft[y * CANVAS_SIZE + x] = index end
       end
+    else
+      for rgb, index in pairs(colors) do
+        lookup[app.pixelColor.rgba(rgb // 65536, (rgb // 256) % 256, rgb % 256, 255)] = index
+      end
+    end
+    for px in img:pixels() do
+      local index = lookup[px()]
+      if index then draft[px.y * CANVAS_SIZE + px.x] = index end
     end
     return draft
   end
@@ -720,20 +717,39 @@ local function createColorIndices(sprite, cel, palette)
   -- Sends what changed since the last call: changed pixels, or the whole draft.
   -- Reading the draft only happens after the sprite changes (or a different sprite or frame shows), so an idle
   -- Aseprite costs nothing and painting costs at most four reads a second.
-  local function onSpriteChange() stream.dirty = true end
+  -- Kept across runs of the script, so the listener can always be removed again.
+  stream.onSpriteChange = stream.onSpriteChange or function() rawget(_G, "__basepriteStream").dirty = true end
   local function watchSprite(sprite)
     if stream.watchedSprite == sprite then return end
     local old = stream.watchedSprite
-    if old then pcall(function() old.events:off(onSpriteChange) end) end
+    if old then pcall(function() old.events:off(stream.onSpriteChange) end) end
     stream.watchedSprite = sprite
-    if sprite then pcall(function() sprite.events:on("change", onSpriteChange) end) end
+    if sprite then pcall(function() sprite.events:on("change", stream.onSpriteChange) end) end
     stream.dirty = true
+  end
+
+  -- Hiding or locking a layer fires no change event, but changes what streams.
+  local function layerFlags(layers, parts)
+    for _, layer in ipairs(layers) do
+      parts[#parts + 1] = (layer.isVisible and "v" or "h") .. (layer.isEditable and "u" or "l")
+      if layer.isGroup then
+        parts[#parts + 1] = "("
+        layerFlags(layer.layers, parts)
+        parts[#parts + 1] = ")"
+      end
+    end
+    return parts
   end
 
   local function streamDraft()
     local day = currentBasepaintDay()
     watchSprite(app.activeSprite)
     local frameNumber = app.activeFrame and app.activeFrame.frameNumber
+    local flags = app.activeSprite and table.concat(layerFlags(app.activeSprite.layers, {})) or ""
+    if flags ~= stream.layerFlags then
+      stream.layerFlags = flags
+      stream.dirty = true
+    end
     if not stream.dirty and stream.readDay == day and stream.readFrame == frameNumber then return end
     stream.dirty = false
     stream.readDay = day
@@ -793,9 +809,12 @@ local function createColorIndices(sprite, cel, palette)
     if frame ~= stream.lastFrame and sendFrame(frame) then stream.lastFrame = frame end
     -- Pixels four times a second; the cursor twenty.
     stream.tick = ((stream.tick or 0) + 1) % 5
-    if stream.settings.key and stream.tick == 0 then
+    if stream.settings.key and stream.tick == 0 and os.clock() >= (stream.nextDraftAt or 0) then
+      local started = os.clock()
       local ok, err = pcall(streamDraft)
       if not ok then setStreamStatus("Draft stream error: " .. tostring(err)) end
+      -- Drafts never take more than a tenth of Aseprite's time: a slow read (many full layers) just updates less often.
+      stream.nextDraftAt = os.clock() + (os.clock() - started) * 9
     end
   end
 
