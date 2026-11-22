@@ -627,21 +627,33 @@ local function createColorIndices(sprite, cel, palette)
     if not colors then return nil end
     if not stream.badKey then setStreamStatus("Streaming your cursor and drafts") end
     local draft = {}
-    -- The painter's visible, unlocked layers in the current frame. A layer that fills the whole canvas with no
-    -- transparent pixel is a background (a pasted or grabbed canvas) and stays out, as do hidden, locked and
-    -- reference layers. Grab Canvas adds its layer locked.
+    -- Today's palette index for each raw pixel value: an opaque RGBA value, or a sprite palette entry when indexed.
+    local lookup = {}
+    if sprite.colorMode == ColorMode.INDEXED then
+      local spritePalette = sprite.palettes[1]
+      for i = 0, #spritePalette - 1 do
+        local c = spritePalette:getColor(i)
+        if i ~= sprite.transparentColor and c.alpha == 255 then
+          lookup[i] = colors[c.red * 65536 + c.green * 256 + c.blue]
+        end
+      end
+    else
+      for rgb, index in pairs(colors) do
+        lookup[app.pixelColor.rgba(rgb // 65536, (rgb // 256) % 256, rgb % 256, 255)] = index
+      end
+    end
+    -- The painter's visible, unlocked layers in the current frame. A layer that fills the whole canvas with today's
+    -- colors only is a copy of the canvas (pasted or grabbed) and stays out, as do hidden, locked and reference layers.
+    -- A white Background layer with drawing on it isn't all today's colors, so it streams. Grab Canvas adds its layer
+    -- locked.
     local img = Image(sprite.spec)
     local frame = app.activeFrame or sprite.frames[1]
     local function isBackground(cel)
       local b = cel.bounds
       if b.x > 0 or b.y > 0 or b.x + b.width < CANVAS_SIZE or b.y + b.height < CANVAS_SIZE then return false end
-      local clear = cel.image.colorMode == ColorMode.INDEXED and sprite.transparentColor or nil
       for px in cel.image:pixels() do
         local x, y = px.x + b.x, px.y + b.y
-        if x >= 0 and x < CANVAS_SIZE and y >= 0 and y < CANVAS_SIZE then
-          local value = px()
-          if (clear and value == clear) or (not clear and value >> 24 == 0) then return false end
-        end
+        if x >= 0 and x < CANVAS_SIZE and y >= 0 and y < CANVAS_SIZE and not lookup[px()] then return false end
       end
       return true
     end
@@ -658,21 +670,6 @@ local function createColorIndices(sprite, cel, palette)
       end
     end
     drawLayers(sprite.layers)
-    -- Today's palette index for each raw pixel value: an opaque RGBA value, or a sprite palette entry when indexed.
-    local lookup = {}
-    if img.colorMode == ColorMode.INDEXED then
-      local spritePalette = sprite.palettes[1]
-      for i = 0, #spritePalette - 1 do
-        local c = spritePalette:getColor(i)
-        if i ~= sprite.transparentColor and c.alpha == 255 then
-          lookup[i] = colors[c.red * 65536 + c.green * 256 + c.blue]
-        end
-      end
-    else
-      for rgb, index in pairs(colors) do
-        lookup[app.pixelColor.rgba(rgb // 65536, (rgb // 256) % 256, rgb % 256, 255)] = index
-      end
-    end
     for px in img:pixels() do
       local index = lookup[px()]
       if index then draft[px.y * CANVAS_SIZE + px.x] = index end
@@ -853,7 +850,7 @@ local function createColorIndices(sprite, cel, palette)
     elseif messageType == WebSocketMessageType.CLOSE then
       resetConnection()
       if stream.socket then setStreamStatus("Reconnecting...") end
-    elseif err then
+    elseif err and tostring(err) ~= "" then
       setStreamStatus("Stream error: " .. tostring(err))
     end
   end
