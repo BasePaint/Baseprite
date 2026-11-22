@@ -52,11 +52,8 @@ end
 
 -- calculate current Basepaint canvas date
 local function getCurrentBasepaintDay()
-  local baseStart = os.time{year=2023, month=8, day=8, hour=16, min=41, sec=5} -- Birthday!
-  local nowUTC = os.time(os.date("!*t"))
-  local secondsPerDay = 60 * 60 * 24
-  local diff = nowUTC - baseStart
-  return math.floor(diff / secondsPerDay)
+  -- Day 1 began at this Unix time; a day is 24 hours.
+  return math.floor((os.time() - 1691599315) / 86400) + 1
 end
 
 local function getScriptFolder()
@@ -105,10 +102,13 @@ local function insertAsNewLayer(day, img)
   cel.image = img
   -- Locked, so it isn't painted on by accident and isn't streamed as the painter's draft.
   layer.isEditable = false
+  -- An empty layer on top to paint on right away.
+  local paintLayer = spr:newLayer()
+  paintLayer.name = "Day " .. tostring(day) .. " painting"
   app.activeSprite = spr
-  app.activeLayer = layer
-  app.activeCel = cel
-  pcall(function() app.command.SelectAll() end)
+  app.activeLayer = paintLayer
+  app.activeFrame = frame
+  app.refresh()
 end
 
 local function exec_ok(a, b, c)
@@ -491,7 +491,7 @@ local function createColorIndices(sprite, cel, palette)
   local dlg = nil
   local palette = getUniqueColors() -- initialize with sprite colors
   local selectedLayerIndex = 2 -- default to Layer 2
-  local currentDayInput = "Day #" -- set default day input text here
+  local currentDayInput = tostring(getCurrentBasepaintDay()) -- today, so Load Palette and Grab Canvas work as is
   local selectedSwatch = 1
   -- Live streaming to BasePaint: your cursor, and with your code from basepaint.xyz/aseprite, your unsaved pixels (the
   -- layer and frame picked below, in today's palette) as a draft other painters can watch. It starts by itself whenever
@@ -946,10 +946,10 @@ local function createColorIndices(sprite, cel, palette)
 
 -- Help Text
   local BASEPRITE_HELP_LINES = {
-    "Day # - Enter a Basepaint day number here! (can be: 100, Day #100, or even try random!)",
+    "Day # - Starts on today. Enter another Basepaint day number to switch (can be: 100, Day #100, or even try random!)",
     "Load Palette - Loads the Basepaint palette from the input Day #.",
     "Enter Hex - Manually set the palette using space-separated hex codes.",
-    "Grab Canvas - Downloads the canvas for the input Day # as a new layer.",
+    "Grab Canvas - Downloads the canvas for the input Day # as a locked layer, with an empty layer on top to paint on.",
     "Palette - View the active color palette! Click on a swatch to select the color.",
     "Layer Menu - The layers dropdown menu, select which layer will be saved/copied.",
     "Frame Input - Enter the Frame # you're targeting for export.",
@@ -1003,7 +1003,7 @@ local function createColorIndices(sprite, cel, palette)
       text = "Load Palette",
       onclick = function()
         local rawDay = dlg.data and dlg.data.dayInput or "1"
-        local maxDay = getCurrentBasepaintDay() + 1
+        local maxDay = getCurrentBasepaintDay()
         local day
 
         if tostring(rawDay):lower():find("random") then
@@ -1094,7 +1094,7 @@ local function createColorIndices(sprite, cel, palette)
       onclick = function()
         local rawDay = dlg.data and dlg.data.dayInput or ""
         local day = parseDayInput(rawDay)
-        local maxDay = getCurrentBasepaintDay() + 1
+        local maxDay = getCurrentBasepaintDay()
 
         if not day then
           app.alert("Please enter a Day #.")
