@@ -103,6 +103,8 @@ local function insertAsNewLayer(day, img)
   layer.name = "Day " .. tostring(day)
   local cel = spr:newCel(layer, frame)
   cel.image = img
+  -- Locked, so it isn't painted on by accident and isn't streamed as the painter's draft.
+  layer.isEditable = false
   app.activeSprite = spr
   app.activeLayer = layer
   app.activeCel = cel
@@ -614,19 +616,6 @@ local function createColorIndices(sprite, cel, palette)
   end
 
   -- The streamed layer: the one picked in the layer menu while the dialog is open, else the last one picked.
-  local function streamedCel(sprite)
-    local data = stream.dialog and stream.dialog.data
-    if data and data.layer then stream.layerName = data.layer end
-    if data and data.frame then stream.frameNumber = tonumber(tostring(data.frame):match("%d+")) end
-    for _, layer in ipairs(sprite.layers) do
-      if layer.name == stream.layerName then
-        local frame = sprite.frames[math.min(math.max(stream.frameNumber or 1, 1), #sprite.frames)]
-        return layer:cel(frame)
-      end
-    end
-    return nil
-  end
-
   -- The draft as y * 256 + x -> value, or nil when there's nothing to stream from (no 256x256 sprite, no palette).
   local function readDraft(day)
     local sprite = app.activeSprite
@@ -638,10 +627,38 @@ local function createColorIndices(sprite, cel, palette)
     if not colors then return nil end
     if not stream.badKey then setStreamStatus("Streaming your cursor and drafts") end
     local draft = {}
-    local cel = streamedCel(sprite)
-    if not cel then return draft end
-    local img = cel.image
-    local pos = cel.position
+    -- The painter's visible, unlocked layers in the current frame. A layer that fills the whole canvas with no
+    -- transparent pixel is a background (a pasted or grabbed canvas) and stays out, as do hidden, locked and
+    -- reference layers. Grab Canvas adds its layer locked.
+    local img = Image(sprite.spec)
+    local frame = app.activeFrame or sprite.frames[1]
+    local function isBackground(cel)
+      local b = cel.bounds
+      if b.x > 0 or b.y > 0 or b.x + b.width < CANVAS_SIZE or b.y + b.height < CANVAS_SIZE then return false end
+      local clear = cel.image.colorMode == ColorMode.INDEXED and sprite.transparentColor or nil
+      for px in cel.image:pixels() do
+        local x, y = px.x + b.x, px.y + b.y
+        if x >= 0 and x < CANVAS_SIZE and y >= 0 and y < CANVAS_SIZE then
+          local value = px()
+          if (clear and value == clear) or (not clear and app.pixelColor.rgbaA(value) == 0) then return false end
+        end
+      end
+      return true
+    end
+    local function drawLayers(layers)
+      for _, layer in ipairs(layers) do
+        if layer.isVisible and layer.isEditable and not layer.isReference then
+          if layer.isGroup then
+            drawLayers(layer.layers)
+          else
+            local cel = layer:cel(frame)
+            if cel and not isBackground(cel) then img:drawImage(cel.image, cel.position) end
+          end
+        end
+      end
+    end
+    drawLayers(sprite.layers)
+    local pos = { x = 0, y = 0 }
     local isIndexed = img.colorMode == ColorMode.INDEXED
     local spritePalette = isIndexed and sprite.palettes[1]
     for px in img:pixels() do
@@ -903,7 +920,7 @@ local function createColorIndices(sprite, cel, palette)
     "Copy to Clipboard - Copies the pixel data to your clipboard, ready to paste into Basepaint!",
     "Start/Stop Streaming - Shows your cursor live on Basepaint. Baseprite remembers your choice next time it opens.",
     "Set Key - Paste your key from basepaint.xyz/aseprite, once. Then others see your drafts live:",
-    "(the layer & frame picked above, in today's palette, on a 256x256 sprite. Stopping takes your draft down.)",
+    "(your visible, unlocked layers on a 256x256 sprite, in today's palette. A layer that fills the whole canvas counts as background and stays out. Stopping takes your draft down.)",
   }
 
   local function showBasepriteHelp()
