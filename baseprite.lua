@@ -10,7 +10,7 @@
 --    \::/__/      /:/  /      \::/  /      \:\__\                    |:|  |     \/__/               \:\__\    
 --     ~~          \/__/        \/__/        \/__/                     \|__|                          \/__/    
 
--- Baseprite by Creamy! 🐸💙🖌️ v2.4
+-- Baseprite by Creamy! 🐸💙🖌️ v2.5
 
 -- fetch palette from "basepaint.xyz/api/theme/day#"
 local function fetchBasepaintPalette(day)
@@ -491,42 +491,79 @@ local function createColorIndices(sprite, cel, palette)
   local selectedLayerIndex = 2 -- default to Layer 2
   local currentDayInput = "Day #" -- set default day input text here
   local selectedSwatch = 1
-  local CURSOR_STREAM_URL = "ws://aseprite.basepaint.xyz/baseprite"
+  -- Live streaming to BasePaint: your cursor, and with your key from basepaint.xyz/aseprite, your unsaved pixels (the
+  -- layer and frame picked below, in today's palette) as a draft other painters can watch. It starts by itself whenever
+  -- Baseprite opens, unless you stopped it; that choice and the key are saved in baseprite_settings.txt next to this
+  -- script.
   local CURSOR_MOVE = 1
   local CURSOR_LEAVE = 2
-  -- The script is re-run when its dialog is reopened; keep one shared stream.
-  local cursorStream = rawget(_G, "__basepriteCursorStream")
-  if type(cursorStream) ~= "table" then
-    cursorStream = { status = "Cursor stream stopped" }
-    rawset(_G, "__basepriteCursorStream", cursorStream)
+  local LAYER = 6
+  local LAYER_PIXELS = 9
+  local CANVAS_SIZE = 256
+  -- BasePaint day 1 began at this Unix time; a day is 24 hours.
+  local BASEPAINT_STARTED_AT = 1691599315
+  -- A change this big goes as the whole layer instead, like the website does.
+  local MAX_CHANGED_PIXELS = 2000
+  local SETTINGS_PATH = getScriptFolder() .. "baseprite_settings.txt"
+
+  local function loadSettings()
+    local settings = {}
+    local f = io.open(SETTINGS_PATH, "r")
+    if not f then return settings end
+    for line in f:lines() do
+      local name, value = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+      if name then settings[name] = value end
+    end
+    f:close()
+    return settings
   end
 
-  local function setCursorStreamStatus(status)
-    cursorStream.status = status
-    local dialog = cursorStream.dialog
+  local function saveSettings(settings)
+    local f = io.open(SETTINGS_PATH, "w")
+    if not f then return end
+    for _, name in ipairs({ "stream", "key", "server", "site" }) do
+      if settings[name] and settings[name] ~= "" then f:write(name, "=", settings[name], "\n") end
+    end
+    f:close()
+  end
+
+  -- The script is re-run when its dialog is reopened; keep one shared stream.
+  local oldStream = rawget(_G, "__basepriteCursorStream")
+  if type(oldStream) == "table" and oldStream.socket then
+    -- Left running by an older Baseprite in this Aseprite session.
+    if oldStream.timer then pcall(function() oldStream.timer:stop() end) end
+    pcall(function() oldStream.socket:close() end)
+    oldStream.socket = nil
+  end
+  local stream = rawget(_G, "__basepriteStream")
+  if type(stream) ~= "table" then
+    stream = { status = "Streaming is off" }
+    rawset(_G, "__basepriteStream", stream)
+  end
+  stream.settings = loadSettings()
+  local function serverUrl()
+    local url = stream.settings.server or "ws://aseprite.basepaint.xyz/baseprite"
+    return stream.settings.key and (url .. "?key=" .. stream.settings.key) or url
+  end
+  local function siteUrl() return stream.settings.site or "https://basepaint.xyz" end
+
+  local function currentBasepaintDay()
+    return math.floor((os.time() - BASEPAINT_STARTED_AT) / 86400) + 1
+  end
+
+  local function setStreamStatus(status)
+    stream.status = status
+    local dialog = stream.dialog
     if not dialog then return end
     pcall(function()
-      dialog:modify{
-        id = "cursorStreamToggle",
-        text = cursorStream.socket and "Stop Cursor Stream" or "Start Cursor Stream"
-      }
-      dialog:modify{ id = "cursorStreamStatus", text = status }
+      dialog:modify{ id = "streamToggle", text = stream.socket and "Stop Streaming" or "Start Streaming" }
+      dialog:modify{ id = "streamStatus", text = status }
     end)
   end
 
-  local function stopCursorStreamTimer()
-    if cursorStream.timer then
-      cursorStream.timer:stop()
-      cursorStream.timer = nil
-    end
-  end
-
-  local function sendCursorStreamFrame(frame)
-    if not cursorStream.socket then return false end
-    local ok = pcall(function()
-      cursorStream.socket:sendBinary(frame)
-    end)
-    return ok
+  local function sendFrame(frame)
+    if not stream.socket or not stream.isOpen then return false end
+    return pcall(function() stream.socket:sendBinary(frame) end)
   end
 
   local function currentCursorFrame()
@@ -548,79 +585,274 @@ local function createColorIndices(sprite, cel, palette)
     )
   end
 
-  local function sampleCursorStream()
+  -- Today's palette as rgb -> palette index + 1, the value a draft pixel carries (0 is empty).
+  local function todaysColors(day)
+    if stream.colorsDay == day then return stream.colors end
+    local colors = nil
+    local f = io.popen('curl -s "' .. siteUrl() .. '/api/theme/' .. day .. '"')
+    local body = f and f:read("*a") or ""
+    if f then f:close() end
+    local palette = body:match('"palette"%s*:%s*%[(.-)%]')
+    if palette then
+      colors = {}
+      local i = 0
+      for hex in palette:gmatch('"#(%x%x%x%x%x%x)"') do
+        i = i + 1
+        colors[tonumber(hex, 16)] = i
+      end
+    end
+    -- One try a day: Aseprite asks before running curl, so retrying every tick would keep asking.
+    stream.colorsDay = day
+    stream.colors = colors
+    if not colors then setStreamStatus("Couldn't load today's palette. Stop and start streaming to retry.") end
+    return colors
+  end
+
+  -- The streamed layer: the one picked in the layer menu while the dialog is open, else the last one picked.
+  local function streamedCel(sprite)
+    local data = stream.dialog and stream.dialog.data
+    if data and data.layer then stream.layerName = data.layer end
+    if data and data.frame then stream.frameNumber = tonumber(tostring(data.frame):match("%d+")) end
+    for _, layer in ipairs(sprite.layers) do
+      if layer.name == stream.layerName then
+        local frame = sprite.frames[math.min(math.max(stream.frameNumber or 1, 1), #sprite.frames)]
+        return layer:cel(frame)
+      end
+    end
+    return nil
+  end
+
+  -- The draft as y * 256 + x -> value, or nil when there's nothing to stream from (no 256x256 sprite, no palette).
+  local function readDraft(day)
+    local sprite = app.activeSprite
+    if not sprite or sprite.width ~= CANVAS_SIZE or sprite.height ~= CANVAS_SIZE then return nil end
+    local colors = todaysColors(day)
+    if not colors then return nil end
+    local draft = {}
+    local cel = streamedCel(sprite)
+    if not cel then return draft end
+    local img = cel.image
+    local pos = cel.position
+    local isIndexed = img.colorMode == ColorMode.INDEXED
+    local spritePalette = isIndexed and sprite.palettes[1]
+    for px in img:pixels() do
+      local x = px.x + pos.x
+      local y = px.y + pos.y
+      if x >= 0 and x < CANVAS_SIZE and y >= 0 and y < CANVAS_SIZE then
+        local value = px()
+        local r, g, b, a
+        if isIndexed then
+          if value ~= sprite.transparentColor and value < #spritePalette then
+            local c = spritePalette:getColor(value)
+            r, g, b, a = c.red, c.green, c.blue, c.alpha
+          end
+        else
+          r, g, b, a = app.pixelColor.rgbaR(value), app.pixelColor.rgbaG(value),
+            app.pixelColor.rgbaB(value), app.pixelColor.rgbaA(value)
+        end
+        local index = a == 255 and colors[r * 65536 + g * 256 + b]
+        if index then draft[y * CANVAS_SIZE + x] = index end
+      end
+    end
+    return draft
+  end
+
+  local function dayHeader(type, day)
+    return string.char(type, math.floor(day / 256), day % 256)
+  end
+
+  -- The whole draft as zlib data the server inflates: two "stored" (uncompressed) deflate blocks, no zlib library
+  -- needed. It is about 64 KB, sent only when the stream starts and after big changes.
+  local function packDraft(draft)
+    local bytes = {}
+    for i = 1, CANVAS_SIZE * CANVAS_SIZE do bytes[i] = 0 end
+    for index, value in pairs(draft) do bytes[index + 1] = value end
+    local chunks = {}
+    for i = 1, #bytes, 4096 do chunks[#chunks + 1] = string.char(table.unpack(bytes, i, i + 4095)) end
+    local grid = table.concat(chunks)
+
+    local a, b = 1, 0
+    for i = 1, #bytes do
+      a = (a + bytes[i]) % 65521
+      b = (b + a) % 65521
+    end
+    local function block(isLast, data)
+      local n = #data
+      return string.char(isLast and 1 or 0, n % 256, math.floor(n / 256),
+        (65535 - n) % 256, math.floor((65535 - n) / 256)) .. data
+    end
+    return "\120\1" .. block(false, grid:sub(1, 65535)) .. block(true, grid:sub(65536)) ..
+      string.char(math.floor(b / 256), b % 256, math.floor(a / 256), a % 256)
+  end
+
+  local function countOf(t)
+    local n = 0
+    for _ in pairs(t) do n = n + 1 end
+    return n
+  end
+
+  -- Sends what changed since the last call: changed pixels, or the whole draft.
+  local function streamDraft()
+    local day = currentBasepaintDay()
+    local draft = readDraft(day)
+    if not draft then return end
+    local sent = stream.sentDay == day and stream.sent or nil
+
+    local changes = nil
+    if sent then
+      changes = {}
+      for index, value in pairs(draft) do
+        if sent[index] ~= value then changes[#changes + 1] = index; changes[#changes + 1] = value end
+      end
+      for index in pairs(sent) do
+        if not draft[index] then changes[#changes + 1] = index; changes[#changes + 1] = 0 end
+      end
+      if #changes == 0 then return end
+    end
+
+    local ok
+    if next(draft) == nil then
+      -- Nothing to show: take down a draft only if this stream put one up.
+      if not stream.hasSentLayer or sendFrame(dayHeader(LAYER, day)) then
+        stream.hasSentLayer = false
+        -- The first pixels after this go whole, replacing anything the server still holds for this painter.
+        stream.sent = nil
+      end
+      return
+    elseif changes and #changes <= MAX_CHANGED_PIXELS * 2 then
+      local parts = { dayHeader(LAYER_PIXELS, day) }
+      for i = 1, #changes, 2 do
+        local index = changes[i]
+        parts[#parts + 1] = string.char(index % CANVAS_SIZE, math.floor(index / CANVAS_SIZE), changes[i + 1])
+      end
+      ok = sendFrame(table.concat(parts))
+      if ok then stream.hasSentLayer = true end
+    else
+      ok = sendFrame(dayHeader(LAYER, day) .. packDraft(draft))
+      if ok then stream.hasSentLayer = true end
+    end
+    if ok then
+      stream.sent = draft
+      stream.sentDay = day
+    end
+  end
+
+  local function onTick()
     local frame = currentCursorFrame()
-    if frame ~= cursorStream.lastFrame and sendCursorStreamFrame(frame) then
-      cursorStream.lastFrame = frame
+    if frame ~= stream.lastFrame and sendFrame(frame) then stream.lastFrame = frame end
+    -- Pixels four times a second; the cursor twenty.
+    stream.tick = ((stream.tick or 0) + 1) % 5
+    if stream.settings.key and stream.tick == 0 then
+      local ok, err = pcall(streamDraft)
+      if not ok then setStreamStatus("Draft stream error: " .. tostring(err)) end
     end
   end
 
-  local function stopCursorStream()
-    stopCursorStreamTimer()
-    sendCursorStreamFrame(string.char(CURSOR_LEAVE))
-
-    local socket = cursorStream.socket
-    cursorStream.socket = nil
-    cursorStream.lastFrame = nil
-    if socket then
-      pcall(function() socket:close() end)
+  local function stopTimer()
+    if stream.timer then
+      stream.timer:stop()
+      stream.timer = nil
     end
-    setCursorStreamStatus("Cursor stream stopped")
   end
 
-  local function handleCursorStreamMessage(socket, messageType, _, err)
-    if cursorStream.socket ~= socket then return end
+  local function resetConnection()
+    stream.isOpen = false
+    stream.lastFrame = nil
+    -- The server may have missed what we sent; the next draft goes whole.
+    stream.sent = nil
+    stopTimer()
+  end
+
+  local function handleMessage(socket, messageType, data, err)
+    if stream.socket ~= socket then return end
 
     if messageType == WebSocketMessageType.OPEN then
-      cursorStream.lastFrame = nil
-      setCursorStreamStatus("Streaming to BasePaint")
-      sampleCursorStream()
-      stopCursorStreamTimer()
-      cursorStream.timer = Timer{ interval = 1.0 / 20.0, ontick = sampleCursorStream }
-      cursorStream.timer:start()
+      resetConnection()
+      stream.isOpen = true
+      setStreamStatus(stream.settings.key and "Streaming your cursor and drafts" or
+        "Streaming your cursor. Set Key to share drafts.")
+      onTick()
+      stream.timer = Timer{ interval = 1.0 / 20.0, ontick = onTick }
+      stream.timer:start()
     elseif messageType == WebSocketMessageType.CLOSE then
-      cursorStream.lastFrame = nil
-      stopCursorStreamTimer()
-      setCursorStreamStatus("Cursor stream reconnecting...")
+      resetConnection()
+      if stream.socket then setStreamStatus("Reconnecting...") end
     elseif err then
-      setCursorStreamStatus("Cursor stream error: " .. tostring(err))
+      setStreamStatus("Stream error: " .. tostring(err))
     end
   end
 
-  local function startCursorStream()
-    if cursorStream.socket then return end
+  local function stopStream()
+    stream.colorsDay = nil
+    -- Stopping takes your draft down too, so nobody watches a stale one.
+    if stream.hasSentLayer then sendFrame(dayHeader(LAYER, stream.sentDay or currentBasepaintDay())) end
+    stream.hasSentLayer = false
+    sendFrame(string.char(CURSOR_LEAVE))
+    local socket = stream.socket
+    stream.socket = nil
+    resetConnection()
+    if socket then pcall(function() socket:close() end) end
+    setStreamStatus("Streaming is off")
+  end
+
+  local function startStream()
+    if stream.socket then return end
     if not WebSocket or not WebSocketMessageType then
-      app.alert("This Aseprite version does not support WebSockets.")
+      setStreamStatus("This Aseprite version can't stream. Update Aseprite.")
       return
     end
 
     local socket
     local ok, createError = pcall(function()
       socket = WebSocket{
-        url = CURSOR_STREAM_URL,
+        url = serverUrl(),
         deflate = false,
         minreconnectwait = 1,
         maxreconnectwait = 5,
         onreceive = function(...)
-          handleCursorStreamMessage(socket, ...)
+          handleMessage(socket, ...)
         end,
       }
     end)
-
     if not ok or not socket then
-      setCursorStreamStatus("Could not create cursor WebSocket")
-      app.alert("Could not create cursor WebSocket:\n" .. tostring(createError))
+      setStreamStatus("Could not stream: " .. tostring(createError))
       return
     end
 
-    cursorStream.socket = socket
-    cursorStream.lastFrame = nil
-    setCursorStreamStatus("Connecting to BasePaint...")
+    stream.socket = socket
+    setStreamStatus("Connecting to BasePaint...")
     local connected, connectError = pcall(function() socket:connect() end)
     if not connected then
-      stopCursorStream()
-      app.alert("Could not connect cursor WebSocket:\n" .. tostring(connectError))
+      stopStream()
+      setStreamStatus("Could not connect: " .. tostring(connectError))
     end
+  end
+
+  local function setStreaming(on)
+    stream.settings.stream = on and "on" or "off"
+    saveSettings(stream.settings)
+    if on then startStream() else stopStream() end
+  end
+
+  -- The key from basepaint.xyz/aseprite; streaming reconnects with it.
+  local function askForKey()
+    local keyDlg = Dialog("Baseprite Key")
+    keyDlg
+      :label{ text = "Copy your key from " .. siteUrl() .. "/aseprite and paste it here." }
+      :newrow()
+      :entry{ id = "key", text = "", focus = true }
+      :button{
+        text = "Save",
+        onclick = function()
+          local key = (keyDlg.data.key or ""):match("^%s*([%w%-_%.]+)%s*$")
+          stream.settings.key = key
+          keyDlg:close()
+          if stream.socket then stopStream() end
+          setStreaming(true)
+        end
+      }
+      :button{ text = "Cancel", onclick = function() keyDlg:close() end }
+      :show()
   end
 
   local function pickColor(index)
@@ -651,6 +883,9 @@ local function createColorIndices(sprite, cel, palette)
     "Save to File - Save a .txt file containing the pixel data. Be sure to set a filename & location.",
     "(Once saved, the plugin will attempt to automatically open the file in a plain text editor)",
     "Copy to Clipboard - Copies the pixel data to your clipboard, ready to paste into Basepaint!",
+    "Start/Stop Streaming - Shows your cursor live on Basepaint. Baseprite remembers your choice next time it opens.",
+    "Set Key - Paste your key from basepaint.xyz/aseprite, once. Then others see your drafts live:",
+    "(the layer & frame picked above, in today's palette, on a 256x256 sprite. Stopping takes your draft down.)",
   }
 
   local function showBasepriteHelp()
@@ -674,11 +909,11 @@ local function createColorIndices(sprite, cel, palette)
       title = "Baseprite by Creamy",
       onclose = function()
         if dlg == dialog then dlg = nil end
-        if cursorStream.dialog == dialog then cursorStream.dialog = nil end
+        if stream.dialog == dialog then stream.dialog = nil end
       end,
     }
     dlg = dialog
-    cursorStream.dialog = dialog
+    stream.dialog = dialog
   
     -- day input
     dlg:entry{
@@ -819,16 +1054,18 @@ local function createColorIndices(sprite, cel, palette)
     dlg:newrow()
     dlg:separator()
     dlg:button{
-      id = "cursorStreamToggle",
-      text = cursorStream.socket and "Stop Cursor Stream" or "Start Cursor Stream",
-      onclick = function()
-        if cursorStream.socket then stopCursorStream() else startCursorStream() end
-      end,
+      id = "streamToggle",
+      text = stream.socket and "Stop Streaming" or "Start Streaming",
+      onclick = function() setStreaming(not stream.socket) end,
+    }
+    dlg:button{
+      text = "Set Key",
+      onclick = askForKey,
     }
     dlg:newrow()
     dlg:label{
-      id = "cursorStreamStatus",
-      text = cursorStream.status,
+      id = "streamStatus",
+      text = stream.status,
     }
 
     dlg:newrow()
@@ -1085,3 +1322,4 @@ local function createColorIndices(sprite, cel, palette)
   end
   
   createDialog()
+  if stream.settings.stream ~= "off" then startStream() end
