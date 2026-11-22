@@ -588,24 +588,28 @@ local function createColorIndices(sprite, cel, palette)
   -- Today's palette as rgb -> palette index + 1, the value a draft pixel carries (0 is empty).
   local function todaysColors(day)
     if stream.colorsDay == day then return stream.colors end
-    local colors = nil
-    local f = io.popen('curl -s "' .. siteUrl() .. '/api/theme/' .. day .. '"')
-    local body = f and f:read("*a") or ""
-    if f then f:close() end
-    local palette = body:match('"palette"%s*:%s*%[(.-)%]')
-    if palette then
-      colors = {}
+    -- One try a day, set before trying: Aseprite asks before running curl, and a refusal throws, so retrying every
+    -- tick would keep asking.
+    stream.colorsDay = day
+    stream.colors = nil
+    local path = getScriptFolder() .. "basepaint_theme_data.json"
+    pcall(function()
+      os.execute('curl -s "' .. siteUrl() .. '/api/theme/' .. day .. '" -o "' .. path .. '"')
+      local f = io.open(path, "r")
+      local body = f and f:read("*a") or ""
+      if f then f:close() end
+      local palette = body:match('"palette"%s*:%s*%[(.-)%]')
+      if not palette then return end
+      local colors = {}
       local i = 0
       for hex in palette:gmatch('"#(%x%x%x%x%x%x)"') do
         i = i + 1
         colors[tonumber(hex, 16)] = i
       end
-    end
-    -- One try a day: Aseprite asks before running curl, so retrying every tick would keep asking.
-    stream.colorsDay = day
-    stream.colors = colors
-    if not colors then setStreamStatus("Couldn't load today's palette. Stop and start streaming to retry.") end
-    return colors
+      stream.colors = colors
+    end)
+    if not stream.colors then setStreamStatus("Couldn't load today's palette. Stop and start streaming to retry.") end
+    return stream.colors
   end
 
   -- The streamed layer: the one picked in the layer menu while the dialog is open, else the last one picked.
