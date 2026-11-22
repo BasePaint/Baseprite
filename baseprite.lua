@@ -552,6 +552,7 @@ local function createColorIndices(sprite, cel, palette)
   end
 
   local function setStreamStatus(status)
+    if stream.status == status then return end
     stream.status = status
     local dialog = stream.dialog
     if not dialog then return end
@@ -629,9 +630,13 @@ local function createColorIndices(sprite, cel, palette)
   -- The draft as y * 256 + x -> value, or nil when there's nothing to stream from (no 256x256 sprite, no palette).
   local function readDraft(day)
     local sprite = app.activeSprite
-    if not sprite or sprite.width ~= CANVAS_SIZE or sprite.height ~= CANVAS_SIZE then return nil end
+    if not sprite or sprite.width ~= CANVAS_SIZE or sprite.height ~= CANVAS_SIZE then
+      if not stream.badKey then setStreamStatus("Streaming your cursor. Drafts stream from a 256x256 sprite.") end
+      return nil
+    end
     local colors = todaysColors(day)
     if not colors then return nil end
+    if not stream.badKey then setStreamStatus("Streaming your cursor and drafts") end
     local draft = {}
     local cel = streamedCel(sprite)
     if not cel then return draft end
@@ -772,12 +777,17 @@ local function createColorIndices(sprite, cel, palette)
 
     if messageType == WebSocketMessageType.OPEN then
       resetConnection()
+      stream.badKey = false
       stream.isOpen = true
       setStreamStatus(stream.settings.key and "Streaming your cursor and drafts" or
         "Streaming your cursor. Set Key to share drafts.")
       onTick()
       stream.timer = Timer{ interval = 1.0 / 20.0, ontick = onTick }
       stream.timer:start()
+    elseif messageType == WebSocketMessageType.TEXT and tostring(data):find("bad_key", 1, true) then
+      -- The server didn't accept the key (expired or mistyped): the cursor still shows, drafts don't.
+      stream.badKey = true
+      setStreamStatus("Key not accepted. Copy a new one from " .. siteUrl() .. "/aseprite and Set Key.")
     elseif messageType == WebSocketMessageType.CLOSE then
       resetConnection()
       if stream.socket then setStreamStatus("Reconnecting...") end
@@ -849,8 +859,12 @@ local function createColorIndices(sprite, cel, palette)
         text = "Save",
         onclick = function()
           local key = (keyDlg.data.key or ""):match("^%s*([%w%-_%.]+)%s*$")
-          stream.settings.key = key
           keyDlg:close()
+          if not key then
+            setStreamStatus("That doesn't look like a key. Copy it again from " .. siteUrl() .. "/aseprite.")
+            return
+          end
+          stream.settings.key = key
           if stream.socket then stopStream() end
           setStreaming(true)
         end
