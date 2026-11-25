@@ -544,8 +544,8 @@ local function createColorIndices(sprite, cel, palette)
   end
   stream.settings = loadSettings()
   local function serverUrl()
-    local url = stream.settings.server or "ws://aseprite.basepaint.xyz/baseprite"
-    return stream.settings.key and (url .. "?key=" .. stream.settings.key) or url
+    -- The key goes in the first message, not the URL, so it stays out of server logs.
+    return stream.settings.server or "ws://aseprite.basepaint.xyz/baseprite"
   end
   local function siteUrl() return stream.settings.site or "https://basepaint.xyz" end
 
@@ -838,6 +838,7 @@ local function createColorIndices(sprite, cel, palette)
       resetConnection()
       stream.badKey = false
       stream.isOpen = true
+      if stream.settings.key then pcall(function() socket:sendText('{"key":"' .. stream.settings.key .. '"}') end) end
       setStreamStatus(stream.settings.key and "Streaming your cursor and drafts" or
         "Streaming your cursor. Paste Code to share drafts.")
       onTick()
